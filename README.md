@@ -175,6 +175,141 @@ MCP2518FD 的 `nINT` 是**电平**中断（有未处理标志时拉低）：
 > >12 MHz 失败后芯片会**卡住**（连 10 MHz 也起不来）→ 用 **1 MHz 低速探针**可救回：
 > `modprobe mcp251xfd spi_hz=1000000`，成功后再正常加载。
 
+### 3.6 命令行实测手册（按症状，可直接复制）
+
+#### 症状 A：CAN 完全不通（`ip link set can1 up` 报错 / 没有 can1）
+
+```bash
+# 1) 模块在不在、参数对不对
+lsmod | grep mcp251xfd
+modinfo -p mcp251xfd | head
+cat /sys/module/mcp251xfd/parameters/{poll_us,spi_hz,gpio_poll}
+
+# 2) 芯片是否初始化成功（最关键的一行）
+sudo dmesg | grep -iE 'mcp251xfd|mcp2518' | tail -15
+#   期望: "MCP2518FD rev0.0 (...) c:40.00MHz m:10.00MHz r:10.00MHz e:0.00MHz) successfully initialized."
+#   若见 "Timeout waiting for Oscillator Ready" / "CRC read error" ⇒ SPI 通信有问题（见 §3.5）
+
+# 3) 有没有 netdev
+ls /sys/class/net/ | grep can
+ip -o link show can1 2>&1
+
+# 4) 位定时（up 失败最常见原因：还没设 bitrate）
+ip -details link show can1            # 看 bitrate/dbitrate 是否为空
+sudo ip link set can1 down
+sudo ip link set can1 type can bitrate 1000000 dbitrate 5000000 fd on \
+     loopback off berr-reporting on  # ← fd on 与 dbitrate 必须同一条命令
+sudo ip link set can1 up
+ip -details link show can1 | head -5  # 期望 state UP + bitrate 1000000 + dbitrate 5000000
+```
+
+#### 症状 B：能收不能发 / 发送极慢 / `bus-errors` 暴涨
+
+```bash
+# 1) 看总线错误（ACK 错误会体现在 bus-errors）
+ip -s -d link show can1 | grep -A2 'bus-errors'
+#   持续增长 ⇒ 总线上没有其它节点 ACK（对端没开）
+
+# 2) 用 loopback 自环验证"芯片→驱动→协议栈"这条链本身是好的
+sudo ip link set can1 down
+sudo ip link set can1 type can bitrate 1000000 dbitrate 5000000 fd on loopback on berr-reporting on
+sudo ip link set can1 up
+candump can1 &                 # 或 canrx can1 20
+sleep 0.5
+sudo cansend2k -i can1 -n 100 -r 1000        # 自环下应能发出并被自己收到
+```
+
+#### 症状 C（核心）：中断计数恒为 0 —— **看 GPIO 电平变化**
+
+**① 先看中断与 GPIO 现状**
+
+```bash
+# 中断计数（关键判据）
+grep 'c2f0000.gpio' /proc/interrupts
+#   268:  0 ... c2f0000.gpio  25 Level  spi0.0      ← 恒 0 = 中断没投递
+
+# GPIO 线是否被驱动占用、当前电平、极性
+cat /sys/kernel/debug/gpio | grep -i mcp
+#   gpio-341 (PEE.02 | mcp2518-int) in hi IRQ ACTIVE LOW   ← ACTIVE LOW 表示低电平=有中断
+
+# 该控制器的父中断（AON GPIO 的 4 条 GIC SPI 56..59）有没有登记
+cat /proc/device-tree/bus@0/gpio@c2f0000/interrupts | od -An -tx1
+cat /proc/device-tree/bus@0/gpio@c2f0000/interrupt-controller | od -An -tx1
+```
+
+**② 一边制造中断，一边采样 GPIO 电平（判断信号是否到达 SoC）**
+
+```bash
+# 采样电平的小函数（hi/lo）
+level() { sudo cat /sys/kernel/debug/gpio | grep 'mcp2518-int' \
+          | grep -oE '\) +(in|out) +[a-z]+' | awk '{print $NF}' | head -1; }
+
+# 开 loopback 产生中断（芯片 eINT 会随收发 assert/deassert）
+sudo ip link set can1 down
+sudo ip link set can1 type can bitrate 1000000 dbitrate 5000000 fd on loopback on berr-reporting on
+sudo ip link set can1 up
+
+# 后台持续发帧
+sudo cansend2k -i can1 -n 3000 -r 1000 -q &
+
+# 采样 15 次（每 80 ms）
+echo -n "level: "; for i in $(seq 1 15); do echo -n "$(level) "; sleep 0.08; done; echo
+
+# 断言判据：
+#   电平出现 lo（或序列在 hi/lo 间跳变） ⇒ 信号【到达 SoC 引脚】✓ ⇒ 问题在中断使能/路由
+#   全程 hi（不动）                    ⇒ 信号【没到】✗ ⇒ 查走线/pinmux
+```
+
+**③ 判定方向后继续查**
+
+```bash
+# 若"电平在动但 IRQ 恒 0" ⇒ 查中断路由/BCT：
+grep -n 'pin-2-int-line' <BSP>/vendor/bsp/bootloader/tegra234-mb1-bct-gpioint-p3767-0000.dts
+#   port@EE 里必须有 pin-2-int-line = <4>;（同端口其它 pin 都有，唯独 pin-2 容易漏）
+
+# 触发类型是否影响（0=DT,1=low,2=falling,3=rising,4=both）
+sudo ip link set can1 down; sudo modprobe -r mcp251xfd
+sudo modprobe mcp251xfd irq_flags_mode=2; sudo ip link set can1 up
+grep 'c2f0000.gpio' /proc/interrupts
+
+# 极端手段：直接读寄存器（危险！AON security 区读一次会 SError 重启，勿乱试）
+#   安全做法：只读 gpio 区（例如 PEE.02 的 pin 寄存器 0xc2f1648），不要读 0xc2f0000
+busybox devmem 0xc2f1648 32
+```
+
+> **重要**：上述电平采样必须在 `poll_us=0`（纯中断）下做一次，否则轮询会提前清掉芯片中断标志，
+> 电平和 IRQ 都会表现成"没有中断"（见 §3.4）。
+
+#### 症状 D：RX 丢帧 / `FIFO overflow`
+
+```bash
+# 1) 溢出计数（ip -s 的 errors 列就是 overflow 次数）
+ip -s -d link show can1 | tail -6
+sudo dmesg | grep -c 'FIFO overflow'
+sudo dmesg | grep 'FIFO overflow' | tail -3
+
+# 2) 是否有人在读 socket（没人读 ⇒ 内核队列满 ⇒ 反压驱动 ⇒ 芯片 FIFO 溢出）
+pgrep -af 'candump|canrx|canplayer'
+
+# 3) 正确对账丢帧：发送端 ID 递增，接收端看总数与连续性（candump 自己会丢，别用它判）
+sudo cansend2k -i can1 -n 2000 -r 2000        # ID 0x001..0x7D0
+# 接收侧用 canrx（带间隔统计）：
+/tmp/canrx can1 10
+```
+
+#### 症状 E：速率/抖动不达标
+
+```bash
+# 发送侧（精确绝对时钟 + 可选 SCHED_FIFO）
+sudo cansend2k -i can1 -n 20000 -r 2000 -R
+#   看 actual rate / interval avg·min·max / jitter / hist
+
+# 接收侧逐帧间隔（6 位小数直方图）
+/tmp/canrx can1 10
+
+# 注意：PC 上位机工具的时间戳常常只有 1 ms 精度，无法判断 0.5 ms 间隔
+```
+
 ---
 
 ## 4. 修改点汇总
